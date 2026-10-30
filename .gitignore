@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.pytest_cache/
+secrets/
+.streamlit/secrets.toml
+data/admin.json
+run/
+logs/
+pcaps/
+*.pcapng
