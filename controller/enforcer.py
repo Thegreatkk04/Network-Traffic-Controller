@@ -17,6 +17,24 @@ from controller.core.flow_policy import equal_shares
 K_DEFAULT = 5
 PROTO = {6: "tcp", 17: "udp"}
 HTB_PRIO = {1: 0, 2: 1, 3: 2, 4: 3, 5: 2}
+DEFAULT_RESERVE_KBPS = 300       # guaranteed to each device's default class (new / unclassified flows)
+DEFAULT_RESERVE_FRAC = 0.10      # ... but never more than this share of the link
+
+
+def reserve_default(share, reserve):
+    """Make sure the device's default class keeps `reserve` kbps, so a new connection
+    does not starve for the 10-15 s until it is classified. The reserve is taken from
+    the device's own bulk classes first (download, then streaming, then browsing), never
+    from real-time, so the device total stays the same."""
+    need = reserve - share[K_DEFAULT]
+    for k in (4, 3, 2):
+        if need <= 0:
+            break
+        take = min(need, max(share[k] - 8, 0))
+        share[k] -= take
+        share[K_DEFAULT] += take
+        need -= take
+    return share
 
 NFT = """
 table inet bwmgr {
@@ -117,6 +135,7 @@ class Enforcer:
                         else:
                             k = K_DEFAULT
                         share[k] += a.rate_kbps
+                    reserve_default(share, min(DEFAULT_RESERVE_KBPS, self.down * DEFAULT_RESERVE_FRAC))
                 devmark[ip] = mark_of(ip, K_DEFAULT)
                 parts[ip] = share
         self._apply_tc(mode, parts, bulk_ceil, caps)

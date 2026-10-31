@@ -485,6 +485,25 @@ def auto_status():
     st.caption("  \n".join(lines))
 
 
+@st.fragment(run_every=5 if CLOUD else 2)
+def policy_selector():
+    s, ctl = load_state() or {}, load_control() or {}
+    modes = s.get("modes") or ["default", "equal", "v1", "v2"]
+    cur = ctl.get("mode", s.get("mode", "v2"))
+    if st.session_state.get("mode_seen") != cur:
+        # the mode was changed somewhere else (experiment script, cloud): show it
+        st.session_state["mode_sel"] = cur if cur in modes else None
+        st.session_state["mode_seen"] = cur
+    sel = st.segmented_control("Policy", modes, format_func=mode_name, key="mode_sel",
+                               label_visibility="collapsed")
+    if sel and sel != cur:
+        write_control(mode=sel)
+        st.session_state["mode_seen"] = sel
+        st.toast(f"Policy set to {mode_name(sel)}")
+        cur = sel
+    st.caption(MODE_INFO.get(cur, ("", ""))[1])
+
+
 # ---------- main page ----------
 def main_view():
     s = load_state() or {}
@@ -507,16 +526,7 @@ def main_view():
     with pol:
         with st.container(border=True):
             card_title("Distribution policy", "Choose how the link is shared. A change takes effect within 2 seconds.")
-            modes = s.get("modes") or ["default", "equal", "v1", "v2"]
-            cur = ctl.get("mode", s.get("mode", "v2"))
-            sel = st.segmented_control("Policy", modes, default=cur if cur in modes else None,
-                                       format_func=mode_name, key="mode_sel",
-                                       label_visibility="collapsed")
-            if sel and sel != cur:
-                write_control(mode=sel)
-                st.toast(f"Policy set to {mode_name(sel)}")
-                cur = sel
-            st.caption(MODE_INFO.get(cur, ("", ""))[1])
+            policy_selector()
     with lnk:
         with st.container(border=True):
             card_title("Link capacity", "Automatic measures the line once, then follows it with ping. "
