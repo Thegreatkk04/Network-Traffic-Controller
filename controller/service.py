@@ -3,8 +3,10 @@
 
 Talks to the dashboard through files, so the dashboard itself needs no root:
   run/state.json    engine -> dashboard, rewritten every 2 s
-  run/control.json  dashboard -> engine: {"mode": "v2", "down": 3000, "up": 1500, "auto": false}
+  run/control.json  dashboard -> engine: {"mode": "v2", "down": 3000, "up": 1500, "auto": false,
+                    "devices": {mac: {"name", "cap_down", "cap_up", "priority", "blocked"}}}
                     auto = true: the link follows the line (controller/autorate.py), down/up ignored
+                    devices: admin rules per device, kept by MAC so they survive IP changes
   logs/history_<time>.csv   one row per device per tick (for the report)
 
   sudo .venv/bin/python -m controller.service --down 3000 --up 1500 [--auto]
@@ -49,6 +51,7 @@ def apply_control(eng, c, tuner=None):
     mode = c.get("mode")
     if mode in MODES and mode != eng.mode:
         eng.set_mode(mode)
+    eng.set_rules(c.get("devices"))
     if tuner:
         if c.get("auto"):
             tuner.enable()
@@ -122,7 +125,10 @@ if __name__ == "__main__":
     eng = Engine(a.iface, a.subnet, a.gw, a.model, a.mode, a.down, a.up, a.dry_run)
     if eng.enf:
         eng.enf.setup()
-    write_json(CONTROL, {"mode": a.mode, "down": a.down, "up": a.up, "auto": a.auto, "ts": time.time()})
+    saved_rules = (read_json(CONTROL) or {}).get("devices") or {}   # device rules survive restarts
+    eng.set_rules(saved_rules)
+    write_json(CONTROL, {"mode": a.mode, "down": a.down, "up": a.up, "auto": a.auto,
+                         "devices": saved_rules, "ts": time.time()})
     hist = os.path.join(LOGS, f"history_{time.strftime('%Y%m%d_%H%M%S')}.csv")
     tuner = LinkTuner(eng, a.ping_target)
     if a.auto:

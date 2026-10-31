@@ -28,7 +28,7 @@ class AdaptiveV3:
         self.ewma, self.boost, self.prev_drops = {}, {}, {}
         self.bulk_frac, self.info = 1.0, {}
 
-    def step(self, devices, link_kbps, stats, rates):
+    def step(self, devices, link_kbps, stats, rates, tiers=None, caps=None):
         """devices: list of DeviceFlows (raw demand)
         stats: {class_minor: (backlog_bytes, total_drops)} from the download-side queues
         rates: {class_minor: guaranteed_kbps currently applied}
@@ -84,7 +84,7 @@ class AdaptiveV3:
                 b = self.boost.get((d.ip, k), 1.0) if k in DELAY_TARGET_MS else 1.0
                 out.append(FlowState(f.flow_id, f.activity, f.confidence, v * b))
             boosted.append(DeviceFlows(d.ip, out))
-        alloc = allocate_flows(boosted, link_kbps, "v2")
+        alloc = allocate_flows(boosted, link_kbps, "v2", tiers=tiers, caps=caps)
         bulk_ceil = int(link_kbps * self.bulk_frac)
 
         self.info = {

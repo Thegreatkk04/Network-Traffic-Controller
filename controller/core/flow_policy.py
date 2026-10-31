@@ -13,6 +13,10 @@ Rules:
   4. Tiny flows (ACKs, background chatter) are ignored.
   5. v2 only: wants follow measured demand, but call/gaming flows keep a
      reserve so a short quiet moment cannot squeeze them to the floor.
+  6. Admin rules per device: a tier (0 high, 1 normal, 2 low) orders devices
+     INSIDE one traffic priority, so a high-tier call goes before other calls,
+     but a high-tier download never goes before anyone's call. A cap limits the
+     device's total; what it cannot take goes to the others.
 """
 from dataclasses import dataclass, field
 
@@ -51,18 +55,28 @@ def _want(f, link_kbps, mode):
     return want
 
 
+def equal_shares(ips, link_kbps, caps=None):
+    """Equal mode: the same share for every device, except a capped device keeps
+    only its cap and the rest is shared by the others."""
+    caps = caps or {}
+    return max_min_share({ip: caps.get(ip, float("inf")) for ip in ips}, link_kbps)
+
+
 def allocate_flows(devices, link_kbps, mode="v2", floor_kbps=500,
-                   min_flow_kbps=MIN_FLOW_KBPS):
+                   min_flow_kbps=MIN_FLOW_KBPS, tiers=None, caps=None):
     """Return {ip: {flow_id: Allocation}}.  Devices with no active flow get
-    one entry named '_idle'. Ignored tiny flows share the device's default class."""
+    one entry named '_idle'. Ignored tiny flows share the device's default class.
+    tiers: {ip: 0|1|2} (default 1)   caps: {ip: max total kbps}"""
     if mode not in ("v1", "v2"):
         raise ValueError("mode must be 'v1' or 'v2'")
     if not devices:
         return {}
+    tiers, caps = tiers or {}, caps or {}
 
     n = len(devices)
     floor = min(floor_kbps, link_kbps // n)
-    remaining = float(link_kbps - floor * n)
+    dev_floor = {d.ip: min(floor, caps.get(d.ip, floor)) for d in devices}
+    remaining = float(link_kbps - sum(dev_floor.values()))
 
     active = {d.ip: sorted((f for f in d.flows if f.demand_kbps >= min_flow_kbps),
                            key=lambda f: (_profile(f).priority, f.flow_id))
@@ -75,20 +89,25 @@ def allocate_flows(devices, link_kbps, mode="v2", floor_kbps=500,
     # the floor is given to each device's most important flow
     floor_flow = {ip: next(iter(rate[ip])) for ip in rate}
     for ip in rate:
-        rate[ip][floor_flow[ip]] += floor
+        rate[ip][floor_flow[ip]] += dev_floor[ip]
 
     def residual_want(ip, f):
         w = _want(f, link_kbps, mode)
-        return max(w - (floor if f.flow_id == floor_flow[ip] else 0), 0)
+        return max(w - (dev_floor[ip] if f.flow_id == floor_flow[ip] else 0), 0)
+
+    def room(ip):                          # how much more a capped device may get
+        return max(caps[ip] - sum(rate[ip].values()), 0) if ip in caps else float("inf")
 
     groups = {}
     for ip, fl in active.items():
         for f in fl:
-            groups.setdefault(_profile(f).priority, {}).setdefault(ip, []).append(f)
+            key = (_profile(f).priority, tiers.get(ip, 1))
+            groups.setdefault(key, {}).setdefault(ip, []).append(f)
 
-    for prio in sorted(groups):
-        by_dev = groups[prio]
-        dev_want = {ip: sum(residual_want(ip, f) for f in fl) for ip, fl in by_dev.items()}
+    for key in sorted(groups):
+        by_dev = groups[key]
+        dev_want = {ip: min(sum(residual_want(ip, f) for f in fl), room(ip))
+                    for ip, fl in by_dev.items()}
         got_dev = max_min_share(dev_want, remaining)          # fair PER DEVICE
         for ip, fl in by_dev.items():
             got = max_min_share({f.flow_id: residual_want(ip, f) for f in fl}, got_dev[ip])
@@ -98,10 +117,11 @@ def allocate_flows(devices, link_kbps, mode="v2", floor_kbps=500,
         if remaining <= 1e-9:
             break
 
-    if remaining > 1e-9:                    # nobody wanted the rest: share equally
-        for ip in rate:
+    if remaining > 1e-9:                    # nobody wanted the rest: share equally (within caps)
+        extra = max_min_share({ip: room(ip) for ip in rate}, remaining)
+        for ip, g in extra.items():
             last = list(rate[ip])[-1]
-            rate[ip][last] += remaining / n
+            rate[ip][last] += g
 
     return {ip: {fid: Allocation(int(r), link_kbps, prio_of[ip][fid])
                  for fid, r in flows.items()}

@@ -12,12 +12,38 @@ from nfstream import NFStreamer
 
 from ml.collect.pcap_to_csv import flow_to_row
 from controller.core.policy import ActivityDebouncer
-from controller.core.flow_policy import DeviceFlows, FlowState, allocate_flows, MIN_FLOW_KBPS
+from controller.core.flow_policy import (DeviceFlows, FlowState, allocate_flows, equal_shares,
+                                         MIN_FLOW_KBPS)
 from controller.core.classify import Classifier
 from controller.enforcer import Enforcer
 from controller.core.v3 import AdaptiveV3
 
 MODES = ("default", "equal", "v1", "v2", "v3")
+TIERS = {"high": 0, "normal": 1, "low": 2}
+
+
+def parse_lease(line):
+    """dnsmasq lease line -> (ip, mac, hostname or "")."""
+    p = line.split()
+    if len(p) < 4:
+        return None
+    return p[2], p[1].lower(), "" if p[3] == "*" else p[3]
+
+
+def rules_by_ip(rules, macs):
+    """Admin rules are saved per MAC; the engine needs them per current IP.
+    Returns (tiers, caps, blocked): {ip: 0|1|2}, {ip: (down|None, up|None)}, {ip}."""
+    tiers, caps, blocked = {}, {}, set()
+    for ip, mac in macs.items():
+        r = rules.get(mac) or {}
+        if r.get("blocked"):
+            blocked.add(ip)
+        if r.get("priority") in TIERS and r["priority"] != "normal":
+            tiers[ip] = TIERS[r["priority"]]
+        cd, cu = int(r.get("cap_down") or 0), int(r.get("cap_up") or 0)
+        if cd or cu:
+            caps[ip] = (cd or None, cu or None)
+    return tiers, caps, blocked
 STALE_S = 12          # forget a flow not seen for this long
 RATE_WINDOW_S = 10.0  # measured throughput = bytes seen in this window
 
@@ -35,7 +61,8 @@ class Engine:
         self.ctl = threading.Lock()       # one control step or link change at a time
         self.flows, self.samples = {}, deque()
         self.history = deque(maxlen=900)  # 30 min at 2 s
-        self.names, self.last_error = {}, None
+        self.names, self.macs, self.last_error = {}, {}, None   # from DHCP leases, by IP
+        self.rules = {}                     # admin rules by MAC: name, cap_down, cap_up, priority, blocked
         self.link_info = {"status": "off"}  # filled by controller/autorate.py when auto is on
         self.state = {"t": 0, "mode": mode, "down": self.down, "up": self.up, "devices": []}
 
@@ -58,8 +85,14 @@ class Engine:
     def public_state(self):
         s = dict(self.state)
         s.update(modes=list(MODES), error=self.last_error, v3=self.v3_info, autorate=self.link_info,
-                 shaping=self.enf is not None, iface=self.iface)
+                 shaping=self.enf is not None, iface=self.iface,
+                 known_devices=[{"ip": ip, "mac": mac, "hostname": self.names.get(ip, "")}
+                                for ip, mac in sorted(self.macs.items())])
         return s
+
+    def set_rules(self, rules):
+        """Admin rules from the control file: {mac: {...}}."""
+        self.rules = {str(m).lower(): r for m, r in (rules or {}).items() if isinstance(r, dict)}
 
     # ---------- capture + classify (runs forever in the main thread) ----------
     def capture(self):
@@ -121,40 +154,51 @@ class Engine:
         return {ip: (d * k, u * k) for ip, (d, u) in acc.items()}
 
     def read_names(self):
-        """Hostnames from the hotspot's DHCP leases (NetworkManager dnsmasq)."""
+        """Hostnames and MAC addresses from the hotspot's DHCP leases (NetworkManager dnsmasq)."""
+        names, macs = {}, {}
         for path in glob.glob("/var/lib/NetworkManager/dnsmasq-*.leases"):
             try:
                 with open(path) as fh:
                     for line in fh:
-                        p = line.split()
-                        if len(p) >= 4 and p[3] != "*":
-                            self.names[p[2]] = p[3]
+                        lease = parse_lease(line)
+                        if lease:
+                            ip, macs[ip], host = lease
+                            if host:
+                                names[ip] = host
             except OSError:
                 pass
+        if macs:                            # keep the last good read if the file is mid-rewrite
+            self.names, self.macs = names, macs
 
     # ---------- one control step ----------
     def tick(self):
+        self.read_names()
         with self.ctl:
             mode, down, up = self.mode, self.down, self.up
             devs = self.snapshot()
+            tiers, caps, blocked = rules_by_ip(self.rules, self.macs)
+            live = [d for d in devs if d.ip not in blocked]
+            down_caps = {ip: c[0] for ip, c in caps.items() if c[0]}
             bulk_ceil = None
             if mode == "v3":
                 stats = self.enf.stats() if self.enf else {}
                 rates = self.enf.class_rates() if self.enf else {}
-                alloc, bulk_ceil = self.v3.step(devs, down, stats, rates) if devs else ({}, None)
+                alloc, bulk_ceil = (self.v3.step(live, down, stats, rates, tiers, down_caps)
+                                    if live else ({}, None))
                 self.v3_info = self.v3.info
             else:
-                alloc = allocate_flows(devs, down, mode) if (mode in ("v1", "v2") and devs) else {}
+                alloc = (allocate_flows(live, down, mode, tiers=tiers, caps=down_caps)
+                         if (mode in ("v1", "v2") and live) else {})
                 self.v3.reset()
                 self.v3_info = {}
+            eq = equal_shares([d.ip for d in live], down, down_caps) if mode == "equal" else {}
             with self.lock:
                 keys = {fid: v["key"] for fid, v in self.flows.items()}
             if self.enf:
-                self.enf.apply(mode, [d.ip for d in devs], alloc, keys, bulk_ceil)
+                self.enf.apply(mode, [d.ip for d in live], alloc, keys, bulk_ceil, caps, blocked)
 
         rates = self.measure()
-        self.read_names()
-        n, out, hist = max(len(devs), 1), [], {}
+        out, hist = [], {}
         for d in devs:
             fa = alloc.get(d.ip, {})
             flows = []
@@ -165,10 +209,12 @@ class Engine:
                 flows.append({"id": f.flow_id, "activity": f.activity, "conf": round(f.confidence, 2),
                               "using": round(f.demand_kbps), "alloc": a.rate_kbps if a else None,
                               "priority": a.priority if a else None})
-            if mode in ("v1", "v2", "v3"):
+            if d.ip in blocked:
+                total = 0
+            elif mode in ("v1", "v2", "v3"):
                 total = sum(a.rate_kbps for a in fa.values())
             elif mode == "equal":
-                total = down // n
+                total = int(eq.get(d.ip, 0))
             else:
                 total = None
             by_act = {}
@@ -178,8 +224,12 @@ class Engine:
             top_act = max(by_act, key=by_act.get) if by_act else None
             top = next((f for f in flows if f["activity"] == top_act), flows[0]) if flows else None
             dk, uk = rates.get(d.ip, (0.0, 0.0))
-            dev = {"ip": d.ip, "name": self.names.get(d.ip, ""),
-                   "activity": top_act or "idle",
+            mac = self.macs.get(d.ip, "")
+            rule = self.rules.get(mac) or {}
+            dev = {"ip": d.ip, "mac": mac, "name": rule.get("name") or self.names.get(d.ip, ""),
+                   "hostname": self.names.get(d.ip, ""),
+                   "rule": {k: rule[k] for k in ("cap_down", "cap_up", "priority", "blocked") if rule.get(k)},
+                   "activity": "blocked" if d.ip in blocked else (top_act or "idle"),
                    "conf": top["conf"] if top else None,
                    "down_kbps": round(dk), "up_kbps": round(uk),
                    "using": round(sum(f.demand_kbps for f in d.flows)),

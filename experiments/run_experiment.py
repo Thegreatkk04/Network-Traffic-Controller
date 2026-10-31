@@ -166,6 +166,9 @@ if __name__ == "__main__":
     link = a.down
     if ctl0.get("auto"):
         print("Automatic link speed is on: switching it off for the run.")
+    if ctl0.get("devices"):
+        print(f"WARNING: {len(ctl0['devices'])} device rule(s) are active (caps / priority / block). "
+              "They change the results; clear them in the dashboard for a fair comparison.")
 
     out_dir = os.path.join(LOGS, f"exp_{time.strftime('%Y%m%d_%H%M%S')}{'_' + a.name if a.name else ''}")
     os.makedirs(out_dir, exist_ok=True)

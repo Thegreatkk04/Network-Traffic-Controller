@@ -324,6 +324,7 @@ def live():
             return
         table = pd.DataFrame([{
             "Device": d["name"] or "Unknown device", "IP": d["ip"],
+            "Rules": rule_badges(d.get("rule") or {}),
             "Activity": d["activity"].capitalize(),
             "Confidence": round((d["conf"] or 0) * 100),
             "Download": d["down_kbps"], "Upload": d["up_kbps"],
@@ -337,7 +338,10 @@ def live():
                 format="%d kbps", help="Rate the policy guarantees. Empty in Default mode (shared queue)."),
         })
         for d in devs:
-            with st.expander(f"{d['name'] or 'Unknown device'}  ·  {d['ip']}"):
+            badges = rule_badges(d.get("rule") or {})
+            with st.expander(f"{d['name'] or 'Unknown device'}  ·  {d['ip']}" + (f"  ·  {badges}" if badges else "")):
+                if d.get("mac"):
+                    st.caption(f"MAC {d['mac']}" + (f"  ·  hostname {d['hostname']}" if d.get("hostname") else ""))
                 if not d["flows"]:
                     st.caption("Only small background flows right now.")
                     continue
@@ -382,6 +386,76 @@ def speed_tool():
         if c2.button("Use suggested", type="primary"):
             write_control(down=sd, up=su)
             st.toast("Link capacity updated")
+            st.rerun()
+
+
+PRIORITY_LABEL = {"high": "High", "normal": "Normal", "low": "Low"}
+
+
+def rule_badges(r):
+    out = []
+    if r.get("blocked"):
+        out.append("⛔ Blocked")
+    if r.get("priority") == "high":
+        out.append("⭐ High")
+    elif r.get("priority") == "low":
+        out.append("▽ Low")
+    if r.get("cap_down") or r.get("cap_up"):
+        out.append("Cap " + " / ".join(fmt(v) if v else "no limit"
+                                       for v in (r.get("cap_down"), r.get("cap_up"))))
+    return "  ".join(out)
+
+
+def device_rules(s, ctl):
+    rules = ctl.get("devices") or {}
+    known = {k["mac"]: k for k in s.get("known_devices") or [] if k.get("mac")}
+    for d in s.get("devices") or []:
+        if d.get("mac"):
+            known.setdefault(d["mac"], {"ip": d["ip"], "mac": d["mac"], "hostname": d.get("hostname", "")})
+
+    def label(mac):
+        k, r = known.get(mac, {}), rules.get(mac, {})
+        name = r.get("name") or k.get("hostname") or "Unknown device"
+        return f"{name}  ·  {k.get('ip', 'not connected')}  ·  {mac}"
+
+    with st.container(border=True):
+        card_title("Device rules", "Name a device, cap its speed, give it priority or block it. "
+                                   "Rules are saved by MAC address, so they follow the device when its IP changes.")
+        macs = sorted(set(known) | set(rules), key=label)
+        if not macs:
+            st.info("No device has connected to the hotspot yet.")
+            return
+        mac = st.selectbox("Device", macs, format_func=label, key="rule_dev")
+        r = rules.get(mac, {})
+        with st.form(f"rule_{mac}", border=False):
+            name = st.text_input("Name", r.get("name", ""), key=f"rn_{mac}",
+                                 placeholder=known.get(mac, {}).get("hostname") or "e.g. Papa's phone")
+            c1, c2 = st.columns(2)
+            cap_down = c1.number_input("Max download (kbps, 0 = no limit)", 0, 1_000_000,
+                                       int(r.get("cap_down") or 0), step=100, key=f"rd_{mac}")
+            cap_up = c2.number_input("Max upload (kbps, 0 = no limit)", 0, 1_000_000,
+                                     int(r.get("cap_up") or 0), step=100, key=f"ru_{mac}")
+            prio = st.radio("Priority", list(PRIORITY_LABEL), index=list(PRIORITY_LABEL).index(
+                                r.get("priority", "normal")), format_func=PRIORITY_LABEL.get,
+                            horizontal=True, key=f"rp_{mac}",
+                            help="Among devices doing the same kind of traffic, High goes first and Low last. "
+                                 "A call still goes before a download, whatever the device. "
+                                 "Used by Adaptive V1, V2 and V3.")
+            blocked = st.checkbox("Block internet for this device", bool(r.get("blocked")), key=f"rb_{mac}")
+            b1, b2, _ = st.columns([1, 1, 3])
+            save = b1.form_submit_button("Save", type="primary")
+            remove = b2.form_submit_button("Remove rule", disabled=mac not in rules)
+        if save or remove:
+            new = dict(rules)
+            entry = {"name": name.strip(), "cap_down": int(cap_down), "cap_up": int(cap_up),
+                     "priority": prio, "blocked": bool(blocked)}
+            entry = {k: v for k, v in entry.items() if v and v != "normal"}
+            if remove or not entry:
+                new.pop(mac, None)
+            else:
+                new[mac] = entry
+            write_control(devices=new)
+            st.toast("Rule removed" if remove else "Rule saved, applied within 2 seconds")
             st.rerun()
 
 
@@ -469,6 +543,7 @@ def main_view():
                         write_control(down=int(down), up=int(up))
                         st.toast("Link capacity updated")
     live()
+    device_rules(s, ctl)
 
 
 if "user" not in st.session_state or (CLOUD and not st.session_state.get("fb")):
