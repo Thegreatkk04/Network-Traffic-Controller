@@ -153,6 +153,14 @@ class Enforcer:
         self.links = {self.lan: down_kbps, self.ifb: up_kbps}
         self.setup()
 
+    def retune(self, down_kbps, up_kbps):
+        """Change the link capacity in place: queues and marks stay. Only the root class
+        changes now; the next apply() re-sends every class whose ceiling used the old link."""
+        self.down = down_kbps
+        self.links = {self.lan: down_kbps, self.ifb: up_kbps}
+        self._tc([f"class change dev {dev} parent 1: classid 1:1 htb rate {link}kbit ceil {link}kbit quantum 1514"
+                  for dev, link in self.links.items()])
+
     def stats(self):
         """Download-side leaf queues: {class_minor: (backlog_bytes, total_drops)}."""
         import json

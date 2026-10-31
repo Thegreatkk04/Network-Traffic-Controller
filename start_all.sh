@@ -1,16 +1,18 @@
 #!/bin/bash
 # Starts hotspot + engine + dashboard together. Ctrl+C stops everything and removes shaping.
-# Usage: ./start_all.sh                    (v2, 3000/1500 kbps, port 8501)
+# Usage: ./start_all.sh                    (v2, auto link speed, port 8501)
+#        AUTO=0 ./start_all.sh             (fixed link 3000/1500, e.g. for experiments)
 #        MODE=v3 DOWN=5000 UP=2000 ./start_all.sh
 cd "$(dirname "$0")"
-MODE=${MODE:-v2}; DOWN=${DOWN:-3000}; UP=${UP:-1500}; PORT=${PORT:-8501}
+MODE=${MODE:-v2}; DOWN=${DOWN:-3000}; UP=${UP:-1500}; PORT=${PORT:-8501}; AUTO=${AUTO:-1}
 
 sudo -v || exit 1                         # ask for the password once, up front
 ./start_hotspot.sh
 mkdir -p logs
 
 sudo .venv/bin/python -m controller.service --iface wlp0s20f3 \
-     --mode "$MODE" --down "$DOWN" --up "$UP" ${DRY:+--dry-run} > logs/service.log 2>&1 &
+     --mode "$MODE" --down "$DOWN" --up "$UP" ${DRY:+--dry-run} $([ "$AUTO" = 1 ] && echo --auto) \
+     > logs/service.log 2>&1 &
 ENGINE=$!
 
 cleanup() {

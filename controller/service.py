@@ -3,15 +3,17 @@
 
 Talks to the dashboard through files, so the dashboard itself needs no root:
   run/state.json    engine -> dashboard, rewritten every 2 s
-  run/control.json  dashboard -> engine: {"mode": "v2", "down": 3000, "up": 1500}
+  run/control.json  dashboard -> engine: {"mode": "v2", "down": 3000, "up": 1500, "auto": false}
+                    auto = true: the link follows the line (controller/autorate.py), down/up ignored
   logs/history_<time>.csv   one row per device per tick (for the report)
 
-  sudo .venv/bin/python -m controller.service --down 3000 --up 1500
+  sudo .venv/bin/python -m controller.service --down 3000 --up 1500 [--auto]
 """
 import argparse, csv, json, os, signal, sys, threading, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from controller.engine import Engine, MODES
+from controller.autorate import LinkTuner
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUN, LOGS = os.path.join(ROOT, "run"), os.path.join(ROOT, "logs")
@@ -43,10 +45,15 @@ def read_json(path):
         return None
 
 
-def apply_control(eng, c):
+def apply_control(eng, c, tuner=None):
     mode = c.get("mode")
     if mode in MODES and mode != eng.mode:
         eng.set_mode(mode)
+    if tuner:
+        if c.get("auto"):
+            tuner.enable()
+            return                     # the tuner owns the link while auto is on
+        tuner.disable()
     down, up = int(c.get("down", eng.down)), int(c.get("up", eng.up))
     if (down, up) != (eng.down, eng.up):
         if not (100 <= down <= 1_000_000 and 100 <= up <= 1_000_000):
@@ -54,7 +61,7 @@ def apply_control(eng, c):
         eng.set_link(down, up)
 
 
-def service_loop(eng, hist_path):
+def service_loop(eng, hist_path, tuner=None):
     fh = open(hist_path, "w", newline="")
     give_to_user(hist_path)
     w = csv.writer(fh)
@@ -67,7 +74,7 @@ def service_loop(eng, hist_path):
         c = read_json(CONTROL)
         if c and c != last_ctl:
             try:
-                apply_control(eng, c)
+                apply_control(eng, c, tuner)
             except Exception as e:
                 errors.append(f"control: {e}")
             last_ctl = c
@@ -104,6 +111,9 @@ if __name__ == "__main__":
     ap.add_argument("--down", type=int, default=3000)
     ap.add_argument("--up", type=int, default=1500)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--auto", action="store_true",
+                    help="measure the line once, then follow it with ping (--down/--up are the start value)")
+    ap.add_argument("--ping-target", default="1.1.1.1", help="host the auto link tuner pings")
     a = ap.parse_args()
 
     for d in (RUN, LOGS):
@@ -112,9 +122,13 @@ if __name__ == "__main__":
     eng = Engine(a.iface, a.subnet, a.gw, a.model, a.mode, a.down, a.up, a.dry_run)
     if eng.enf:
         eng.enf.setup()
-    write_json(CONTROL, {"mode": a.mode, "down": a.down, "up": a.up, "ts": time.time()})
+    write_json(CONTROL, {"mode": a.mode, "down": a.down, "up": a.up, "auto": a.auto, "ts": time.time()})
     hist = os.path.join(LOGS, f"history_{time.strftime('%Y%m%d_%H%M%S')}.csv")
-    threading.Thread(target=service_loop, args=(eng, hist), daemon=True).start()
+    tuner = LinkTuner(eng, a.ping_target)
+    if a.auto:
+        tuner.enable()
+    threading.Thread(target=tuner.run, daemon=True).start()
+    threading.Thread(target=service_loop, args=(eng, hist, tuner), daemon=True).start()
     cloud_cfg = read_json(os.path.join(ROOT, "secrets", "cloud.json"))
     if cloud_cfg:
         from controller.cloud_sync import CloudSync
@@ -132,6 +146,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     finally:
+        tuner.disable()
         if eng.enf:
             eng.enf.teardown()
         s = read_json(STATE) or {}

@@ -36,6 +36,7 @@ class Engine:
         self.flows, self.samples = {}, deque()
         self.history = deque(maxlen=900)  # 30 min at 2 s
         self.names, self.last_error = {}, None
+        self.link_info = {"status": "off"}  # filled by controller/autorate.py when auto is on
         self.state = {"t": 0, "mode": mode, "down": self.down, "up": self.up, "devices": []}
 
     # ---------- admin actions ----------
@@ -44,15 +45,19 @@ class Engine:
             raise ValueError(f"mode must be one of {', '.join(MODES)}")
         self.mode = mode
 
-    def set_link(self, down, up):
+    def set_link(self, down, up, rebuild=True):
+        """rebuild=False changes the rate in place (used by the auto link tuner every few seconds)."""
         with self.ctl:
             self.down, self.up = int(down), int(up)
             if self.enf:
-                self.enf.set_link(self.down, self.up)
+                if rebuild:
+                    self.enf.set_link(self.down, self.up)
+                else:
+                    self.enf.retune(self.down, self.up)
 
     def public_state(self):
         s = dict(self.state)
-        s.update(modes=list(MODES), error=self.last_error, v3=self.v3_info,
+        s.update(modes=list(MODES), error=self.last_error, v3=self.v3_info, autorate=self.link_info,
                  shaping=self.enf is not None, iface=self.iface)
         return s
 

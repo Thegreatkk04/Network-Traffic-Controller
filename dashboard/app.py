@@ -385,6 +385,32 @@ def speed_tool():
             st.rerun()
 
 
+@st.fragment(run_every=5 if CLOUD else 2)
+def auto_status():
+    a = (load_state() or {}).get("autorate") or {}
+    status = a.get("status", "off")
+    if status == "measuring":
+        st.info("Measuring internet speed, about 30 seconds...")
+    elif status == "error":
+        st.error(f"Auto link: {a.get('error')}")
+    elif status == "off":
+        st.caption("Waiting for the engine to switch auto on...")
+        return
+    st.metric("Current link", f"{fmt(a.get('down'))} / {fmt(a.get('up'))}")
+    lines = []
+    m = a.get("measured")
+    if m:
+        lines.append(f"Speed test: {fmt(m['down'])} down, {fmt(m['up'])} up. Started at 85%.")
+    if a.get("baseline_ms") is not None:
+        rtt = f", now {a['rtt_ms']:.0f} ms" if a.get("rtt_ms") is not None else ""
+        lines.append(f"Ping baseline {a['baseline_ms']:.0f} ms{rtt}.")
+    if a.get("load"):
+        lines.append(f"Line in use: {fmt(a['load']['down'])} down, {fmt(a['load']['up'])} up.")
+    if a.get("action"):
+        lines.append(f"Last change: {a['action']}.")
+    st.caption("  \n".join(lines))
+
+
 # ---------- main page ----------
 def main_view():
     s = load_state() or {}
@@ -419,18 +445,29 @@ def main_view():
             st.caption(MODE_INFO.get(cur, ("", ""))[1])
     with lnk:
         with st.container(border=True):
-            card_title("Link capacity", "Set about 80% of the real speed, or a fixed low value for experiments.")
-            if not CLOUD:
-                speed_tool()
-            with st.form("link", border=False):
-                a, b = st.columns(2)
-                down = a.number_input("Download (kbps)", 100, 1_000_000,
-                                      int(ctl.get("down", s.get("down", 3000))), step=100)
-                up = b.number_input("Upload (kbps)", 100, 1_000_000,
-                                    int(ctl.get("up", s.get("up", 1500))), step=100)
-                if st.form_submit_button("Apply"):
-                    write_control(down=int(down), up=int(up))
-                    st.toast("Link capacity updated")
+            card_title("Link capacity", "Automatic measures the line once, then follows it with ping. "
+                                        "Turn it off for a fixed value, e.g. during experiments.")
+            auto = bool(ctl.get("auto"))
+            new_auto = st.toggle("Automatic", value=auto, key="auto_sel")
+            if new_auto != auto:
+                # turning it off keeps the link where auto left it
+                write_control(auto=new_auto, down=int(s.get("down", 3000)), up=int(s.get("up", 1500)))
+                st.toast("Automatic link speed " + ("on" if new_auto else "off"))
+                auto = new_auto
+            if auto:
+                auto_status()
+            else:
+                if not CLOUD:
+                    speed_tool()
+                with st.form("link", border=False):
+                    a, b = st.columns(2)
+                    down = a.number_input("Download (kbps)", 100, 1_000_000,
+                                          int(ctl.get("down", s.get("down", 3000))), step=100)
+                    up = b.number_input("Upload (kbps)", 100, 1_000_000,
+                                        int(ctl.get("up", s.get("up", 1500))), step=100)
+                    if st.form_submit_button("Apply"):
+                        write_control(down=int(down), up=int(up))
+                        st.toast("Link capacity updated")
     live()
 
 
